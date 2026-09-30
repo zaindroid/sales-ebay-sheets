@@ -28,29 +28,30 @@ current quantities of your eBay listings and mirrors them into the sheet, so
 - `Sales Log` tab: one line per sync that saw new sales (time, item, units, available after).
 - `L1` shows the last successful sync, `L2` the last error, so you can see at a glance if it stopped.
 
-## Setup (about 15 minutes)
+## Setup (about 15 minutes, all in the browser)
 
-1. **eBay developer keys.** Create a free account at developer.ebay.com, create an application keyset
-   (Production), and copy the **App ID**, **Cert ID** and a **RuName** (User Tokens → "Get a Token from
-   eBay via Your Application"; set the accept/decline URLs to any page you own, e.g. `https://example.com/`).
-   Note: eBay may ask you to either set up a *Marketplace Account Deletion* endpoint or apply for an
-   exemption before enabling Production keys. For a single-seller store the exemption is the easy route.
-2. **Sheet.** Create a Google Sheet → Extensions → Apps Script. Replace the editor's code with
-   `apps-script/Code.gs`. In Project Settings tick "Show appsscript.json" and paste in `apps-script/appsscript.json`
-   (optional, but gives the script the narrowest permissions). Save and reload the sheet.
-3. Use the new **eBay Sync** menu, in order:
-   1. *Set up sheet*
-   2. *Save eBay app keys* (App ID, Cert ID, RuName, PRODUCTION)
-   3. *Connect eBay account* (sign in, approve, paste the address you land on)
-   4. *Test connection*, which should report your number of active listings
-   5. *Sync now*, then *Start auto-sync*
+1. **eBay developer keys.** Create a free account at developer.ebay.com and an application keyset (Production).
+   Copy the **App ID** and **Cert ID**. eBay may ask you to either set up a *Marketplace Account Deletion*
+   endpoint or apply for an exemption before enabling Production keys; for a single-seller store the exemption is the easy route.
+2. **Put the script in your sheet.** Create a Google Sheet → Extensions → Apps Script. Add `Code.gs` and `Sidebar.html`
+   from `apps-script/` (File → + → HTML for the second one, named exactly `Sidebar`). In Project Settings tick
+   "Show appsscript.json" and paste in `appsscript.json`.
+3. **Deploy as a web app** (this is what lets eBay sign-in finish by itself): Deploy → New deployment → Web app →
+   Execute as **Me**, access **Anyone** → Deploy → copy the URL ending in `/exec`.
+4. **Create the RuName.** On eBay's developer "User Tokens" page, open *Get a Token from eBay via Your Application*, create a
+   RuName, and set **Auth accepted URL** to the web app URL from step 3. Copy the RuName.
+5. Reload the sheet and open **eBay Sync → Open eBay Sync panel**. Work down it: *Set up Inventory sheet* →
+   paste App ID / Cert ID / RuName → *Save keys* → *Connect eBay account* (sign in on eBay; the panel turns green by itself)
+   → *Test connection* → *Sync now* → *Start auto-sync*.
 
-The first run asks Google for permission (external requests, triggers). That's expected.
+The first run asks Google for permission (external requests, triggers). That's expected. Nobody else can complete an eBay
+sign-in against your sheet: each attempt carries a one-time, 10-minute `state` code that the callback checks.
 
-**If step 3.3/3.4 fails with a scope/permission error** (I could not check eBay's current scope table
-for the Trading API from the build environment): use *(or) Use legacy auth token* instead. Generate an
-"Auth'n'Auth" token on the same eBay developer "User Tokens" page and paste it. It works with the Trading API
-without any scopes. Then run *Test connection* again.
+Skipped step 3? The panel also has a "paste the address instead" box that works without a deployed web app.
+
+**If sign-in or *Test connection* fails with a scope/permission error** (I could not check eBay's current scope table
+for the Trading API from the build environment): open "Sign-in fails with a scope error?" in the panel and paste an
+"Auth'n'Auth" token generated on the same eBay "User Tokens" page. It works with the Trading API without any scopes.
 
 ## Limits to know about
 
@@ -65,4 +66,4 @@ without any scopes. Then run *Test connection* again.
 ## Tests
 
 `node test/sync.test.js` runs the parsing and sync-planning logic against sample eBay XML (sold-out items,
-variations, ended listings, SKU matching, idempotency). It does **not** call eBay.
+variations, ended listings, SKU matching, idempotency) and the sign-in callback's state check. It does **not** call eBay.

@@ -36,16 +36,13 @@ const COMPAT_LEVEL = '1193';
 // ------------------------------------------------------------------ menu ----
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('eBay Sync')
-    .addItem('1. Set up sheet', 'setupSheet')
-    .addItem('2. Save eBay app keys', 'saveCredentials')
-    .addItem('3. Connect eBay account', 'connectEbay')
-    .addItem('   (or) Use legacy auth token', 'saveLegacyToken')
-    .addSeparator()
-    .addItem('Test connection', 'testConnection')
+    .addItem('Open eBay Sync panel', 'showSidebar')
     .addItem('Sync now', 'syncNow')
-    .addItem('Start auto-sync', 'startAutoSync')
-    .addItem('Stop auto-sync', 'stopAutoSync')
     .addToUi();
+}
+
+function showSidebar() {
+  SpreadsheetApp.getUi().showSidebar(HtmlService.createHtmlOutputFromFile('Sidebar').setTitle('eBay Sync'));
 }
 
 function setupSheet() {
@@ -76,7 +73,6 @@ function setupSheet() {
 
   sheet.getRange('K1:L1').setValues([['Last sync check', '']]).setFontWeight('bold');
   sheet.getRange('K2:L2').setValues([['Last error', '']]).setFontWeight('bold');
-  SpreadsheetApp.getUi().alert('Sheet is ready. Next: "2. Save eBay app keys".');
 }
 
 function rule_(range, text, bg, fg) {
@@ -84,64 +80,112 @@ function rule_(range, text, bg, fg) {
     .setBackground(bg).setFontColor(fg).setRanges([range]).build();
 }
 
-// ----------------------------------------------------------- credentials ----
-function saveCredentials() {
-  const ui = SpreadsheetApp.getUi();
-  const props = PropertiesService.getScriptProperties();
-  const ask = (label, key, secret) => {
-    const cur = props.getProperty(key);
-    const r = ui.prompt(label + (cur ? '\n(leave empty to keep the saved value)' : ''), ui.ButtonSet.OK_CANCEL);
-    if (r.getSelectedButton() !== ui.Button.OK) return false;
-    const v = r.getResponseText().trim();
-    if (v) props.setProperty(key, v);
-    return true;
+// ------------------------------------------------- panel / credentials ----
+// These functions are called from Sidebar.html via google.script.run.
+const PROP_KEYS = ['EBAY_CLIENT_ID', 'EBAY_CLIENT_SECRET', 'EBAY_RUNAME', 'EBAY_REFRESH_TOKEN', 'EBAY_LEGACY_TOKEN'];
+
+/** Status for the panel. Never returns secrets, only whether they are set. */
+function getStatus() {
+  const p = PropertiesService.getScriptProperties();
+  const sheet = SpreadsheetApp.getActive().getSheetByName(SHEET_NAME);
+  const syncTriggers = ScriptApp.getProjectTriggers().filter(t => t.getHandlerFunction() === 'syncNow');
+  return {
+    sheetReady: !!sheet,
+    hasKeys: !!(p.getProperty('EBAY_CLIENT_ID') && p.getProperty('EBAY_CLIENT_SECRET') && p.getProperty('EBAY_RUNAME')),
+    connected: !!(p.getProperty('EBAY_REFRESH_TOKEN') || p.getProperty('EBAY_LEGACY_TOKEN')),
+    clientId: p.getProperty('EBAY_CLIENT_ID') || '',
+    runame: p.getProperty('EBAY_RUNAME') || '',
+    env: p.getProperty('EBAY_ENV') || 'PRODUCTION',
+    autoSync: syncTriggers.length > 0,
+    everyMinutes: SYNC_EVERY_MINUTES,
+    lastSync: sheet ? String(sheet.getRange('L1').getDisplayValue()) : '',
+    lastError: sheet ? String(sheet.getRange('L2').getDisplayValue()) : '',
+    webAppUrl: ScriptApp.getService().getUrl() || '',
   };
-  if (!ask('eBay App ID (Client ID)', 'EBAY_CLIENT_ID')) return;
-  if (!ask('eBay Cert ID (Client Secret)', 'EBAY_CLIENT_SECRET')) return;
-  if (!ask('eBay RuName (redirect URL name)', 'EBAY_RUNAME')) return;
-  const env = ui.prompt('Environment: type PRODUCTION (real store) or SANDBOX (testing)', ui.ButtonSet.OK_CANCEL);
-  if (env.getSelectedButton() !== ui.Button.OK) return;
-  props.setProperty('EBAY_ENV', env.getResponseText().trim().toUpperCase() === 'SANDBOX' ? 'SANDBOX' : 'PRODUCTION');
-  ui.alert('Saved. Next: "3. Connect eBay account".');
 }
 
-function connectEbay() {
-  const ui = SpreadsheetApp.getUi();
-  const props = PropertiesService.getScriptProperties();
-  const clientId = props.getProperty('EBAY_CLIENT_ID');
-  const runame = props.getProperty('EBAY_RUNAME');
-  if (!clientId || !runame) return ui.alert('Run "2. Save eBay app keys" first.');
+/** Saves eBay app keys. An empty secret keeps the one already stored. */
+function saveKeys(k) {
+  const p = PropertiesService.getScriptProperties();
+  const clientId = String(k.clientId || '').trim();
+  const runame = String(k.runame || '').trim();
+  const secret = String(k.clientSecret || '').trim();
+  if (!clientId || !runame || (!secret && !p.getProperty('EBAY_CLIENT_SECRET'))) {
+    throw new Error('App ID, Cert ID and RuName are all required.');
+  }
+  p.setProperty('EBAY_CLIENT_ID', clientId);
+  p.setProperty('EBAY_RUNAME', runame);
+  if (secret) p.setProperty('EBAY_CLIENT_SECRET', secret);
+  p.setProperty('EBAY_ENV', k.env === 'SANDBOX' ? 'SANDBOX' : 'PRODUCTION');
+  return getStatus();
+}
 
-  const url = endpoints_().auth + '?client_id=' + encodeURIComponent(clientId) +
+/** Starts the eBay sign-in. The one-time `state` value stops anyone else from completing it. */
+function getConnectUrl() {
+  const p = PropertiesService.getScriptProperties();
+  const clientId = p.getProperty('EBAY_CLIENT_ID');
+  const runame = p.getProperty('EBAY_RUNAME');
+  if (!clientId || !runame) throw new Error('Save your eBay app keys first.');
+  const state = Utilities.getUuid();
+  CacheService.getScriptCache().put('oauth_state_' + state, '1', 600);
+  return endpoints_().auth + '?client_id=' + encodeURIComponent(clientId) +
     '&response_type=code&redirect_uri=' + encodeURIComponent(runame) +
-    '&scope=' + encodeURIComponent(OAUTH_SCOPES.join(' '));
-  const html = HtmlService.createHtmlOutput(
-    '<p>1. Open <a href="' + url + '" target="_blank">this eBay sign-in link</a> and approve access.</p>' +
-    '<p>2. eBay then sends you to your "accepted" page. Copy the <b>whole address</b> from the browser bar.</p>' +
-    '<p>3. Close this box and paste it in the next prompt.</p>').setWidth(420).setHeight(190);
-  ui.showModalDialog(html, 'Connect eBay account');
-
-  const r = ui.prompt('Paste the full address (or just the code=... value) here', ui.ButtonSet.OK_CANCEL);
-  if (r.getSelectedButton() !== ui.Button.OK) return;
-  const code = extractCode_(r.getResponseText());
-  if (!code) return ui.alert('No authorization code found in what you pasted.');
-
-  const res = tokenRequest_({ grant_type: 'authorization_code', code: code, redirect_uri: runame });
-  if (!res.refresh_token) return ui.alert('eBay did not return a refresh token: ' + JSON.stringify(res));
-  props.setProperty('EBAY_REFRESH_TOKEN', res.refresh_token);
-  props.deleteProperty('EBAY_LEGACY_TOKEN');
-  CacheService.getScriptCache().remove('ebay_access_token');
-  ui.alert('Connected. Now run "Test connection".');
+    '&scope=' + encodeURIComponent(OAUTH_SCOPES.join(' ')) + '&state=' + state;
 }
 
-function saveLegacyToken() {
-  const ui = SpreadsheetApp.getUi();
-  const r = ui.prompt('Paste your eBay Auth\'n\'Auth token (from developer.ebay.com > User Tokens)', ui.ButtonSet.OK_CANCEL);
-  if (r.getSelectedButton() !== ui.Button.OK || !r.getResponseText().trim()) return;
-  const props = PropertiesService.getScriptProperties();
-  props.setProperty('EBAY_LEGACY_TOKEN', r.getResponseText().trim());
-  if (!props.getProperty('EBAY_ENV')) props.setProperty('EBAY_ENV', 'PRODUCTION');
-  ui.alert('Saved. Now run "Test connection".');
+/** Manual fallback: the user pastes the address (or code) they landed on after eBay sign-in. */
+function finishConnect(pasted) {
+  const code = extractCode_(pasted);
+  if (!code) throw new Error('No authorization code found in what you pasted.');
+  completeConnect_(code);
+  return getStatus();
+}
+
+function completeConnect_(code) {
+  const p = PropertiesService.getScriptProperties();
+  const res = tokenRequest_({ grant_type: 'authorization_code', code: code, redirect_uri: p.getProperty('EBAY_RUNAME') });
+  if (!res.refresh_token) throw new Error('eBay did not return a refresh token.');
+  p.setProperty('EBAY_REFRESH_TOKEN', res.refresh_token);
+  p.deleteProperty('EBAY_LEGACY_TOKEN');
+  CacheService.getScriptCache().remove('ebay_access_token');
+}
+
+/** eBay redirects here after sign-in when this script is deployed as a web app and its URL is the RuName's accept URL. */
+function doGet(e) {
+  const params = (e && e.parameter) || {};
+  const cache = CacheService.getScriptCache();
+  let msg;
+  try {
+    if (!params.state || !cache.get('oauth_state_' + params.state)) {
+      throw new Error('This sign-in was not started from your sheet, or it expired. Start again from the eBay Sync panel.');
+    }
+    cache.remove('oauth_state_' + params.state);
+    if (!params.code) throw new Error(params.error_description || 'eBay did not send a sign-in code.');
+    completeConnect_(params.code);
+    msg = 'eBay is connected. You can close this tab and go back to your sheet.';
+  } catch (err) {
+    msg = 'Could not connect eBay: ' + err.message;
+  }
+  return HtmlService.createHtmlOutput('<div style="font:16px sans-serif;max-width:480px;margin:15vh auto">' +
+    escapeXml_(msg) + '</div>').setTitle('eBay Sync');
+}
+
+/** Fallback if OAuth scopes are a problem: a legacy Auth'n'Auth token works with the Trading API. */
+function saveLegacyToken(token) {
+  const t = String(token || '').trim();
+  if (!t) throw new Error('Paste the token first.');
+  const p = PropertiesService.getScriptProperties();
+  p.setProperty('EBAY_LEGACY_TOKEN', t);
+  if (!p.getProperty('EBAY_ENV')) p.setProperty('EBAY_ENV', 'PRODUCTION');
+  return getStatus();
+}
+
+function disconnectEbay() {
+  const p = PropertiesService.getScriptProperties();
+  PROP_KEYS.forEach(k => p.deleteProperty(k));
+  CacheService.getScriptCache().remove('ebay_access_token');
+  disableAutoSync();
+  return getStatus();
 }
 
 function extractCode_(text) {
@@ -429,25 +473,20 @@ function syncNow() {
 }
 
 // -------------------------------------------------------------- triggers ----
-function startAutoSync() {
-  stopAutoSync(true);
+function enableAutoSync() {
+  disableAutoSync();
   ScriptApp.newTrigger('syncNow').timeBased().everyMinutes(SYNC_EVERY_MINUTES).create();
-  SpreadsheetApp.getUi().alert('Auto-sync is on (every ' + SYNC_EVERY_MINUTES + ' min).');
+  return getStatus();
 }
 
-function stopAutoSync(silent) {
+function disableAutoSync() {
   ScriptApp.getProjectTriggers().forEach(t => {
     if (t.getHandlerFunction() === 'syncNow') ScriptApp.deleteTrigger(t);
   });
-  if (silent !== true) SpreadsheetApp.getUi().alert('Auto-sync is off.');
+  return getStatus();
 }
 
+/** Returns a message for the panel; throws with eBay's error text on failure. */
 function testConnection() {
-  const ui = SpreadsheetApp.getUi();
-  try {
-    const n = fetchActiveListings_().length;
-    ui.alert('Connected to eBay. Found ' + n + ' active listing(s).');
-  } catch (e) {
-    ui.alert('Connection failed:\n' + e.message);
-  }
+  return 'Connected to eBay. Found ' + fetchActiveListings_().length + ' active listing(s).';
 }

@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body { font: 13px/1.4 Arial, sans-serif; margin: 0; padding: 12px; color: #1f2937; }
+    h3 { margin: 16px 0 6px; font-size: 13px; }
+    .card { border: 1px solid #d1d5db; border-radius: 6px; padding: 10px; margin-bottom: 10px; }
+    .row { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: #d1d5db; flex: none; }
+    .ok { background: #16a34a; } .bad { background: #dc2626; }
+    label { display: block; margin-top: 6px; font-size: 12px; color: #4b5563; }
+    input, select { width: 100%; box-sizing: border-box; padding: 5px; }
+    button { margin-top: 8px; padding: 6px 10px; border: 0; border-radius: 4px; background: #1d4ed8; color: #fff; cursor: pointer; }
+    button.secondary { background: #e5e7eb; color: #1f2937; }
+    button:disabled { opacity: .5; cursor: default; }
+    .msg { margin-top: 8px; padding: 6px; border-radius: 4px; display: none; }
+    .msg.ok { display: block; background: #dcfce7; } .msg.err { display: block; background: #fee2e2; }
+    small, .hint { color: #6b7280; font-size: 12px; }
+    code { background: #f3f4f6; padding: 1px 3px; word-break: break-all; }
+    details { margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="row"><span id="d-sheet" class="dot"></span> Sheet set up</div>
+    <div class="row"><span id="d-keys" class="dot"></span> eBay app keys saved</div>
+    <div class="row"><span id="d-conn" class="dot"></span> eBay account connected</div>
+    <div class="row"><span id="d-auto" class="dot"></span> <span id="auto-text">Auto-sync off</span></div>
+    <div class="hint" id="last"></div>
+    <div id="err" class="msg err"></div>
+  </div>
+
+  <div id="msg" class="msg"></div>
+
+  <h3>1. Sheet</h3>
+  <button id="b-setup" onclick="run('setupSheet', 'Sheet is ready.')">Set up Inventory sheet</button>
+
+  <h3>2. eBay app keys</h3>
+  <label>App ID (Client ID)</label><input id="clientId">
+  <label>Cert ID (Client Secret)</label><input id="clientSecret" type="password" placeholder="(saved values are never shown)">
+  <label>RuName</label><input id="runame">
+  <label>Environment</label>
+  <select id="env"><option>PRODUCTION</option><option>SANDBOX</option></select>
+  <button onclick="saveKeys()">Save keys</button>
+
+  <h3>3. Connect eBay</h3>
+  <button id="b-connect" onclick="connect()">Connect eBay account</button>
+  <div class="hint" style="margin-top:6px">
+    A new tab opens for eBay sign-in. Set your RuName's <b>auth accepted URL</b> to your deployed web app URL
+    (<span id="webapp"><i>not deployed yet - see README</i></span>) and the panel connects by itself.
+  </div>
+  <details>
+    <summary>No web app? Paste the address instead</summary>
+    <label>Address eBay sent you to after sign-in</label><input id="pasted">
+    <button class="secondary" onclick="finish()">Finish connecting</button>
+  </details>
+  <details>
+    <summary>Sign-in fails with a scope error?</summary>
+    <label>Legacy Auth'n'Auth token</label><input id="legacy" type="password">
+    <button class="secondary" onclick="legacy()">Use this token</button>
+  </details>
+
+  <h3>4. Sync</h3>
+  <button onclick="run('testConnection')">Test connection</button>
+  <button onclick="run('syncNow', 'Synced.')">Sync now</button><br>
+  <button id="b-auto" onclick="toggleAuto()">Start auto-sync</button>
+  <div style="margin-top:14px"><button class="secondary" onclick="disconnect()">Disconnect eBay</button></div>
+
+<script>
+  let status = {};
+  const $ = id => document.getElementById(id);
+
+  function show(text, isErr) {
+    const m = $('msg'); m.textContent = text || ''; m.className = 'msg ' + (text ? (isErr ? 'err' : 'ok') : '');
+  }
+  function fail(e) { busy(false); show(e && e.message ? e.message.replace(/^Error:\s*/, '') : String(e), true); refresh(); }
+  function busy(on) { document.querySelectorAll('button').forEach(b => b.disabled = on); }
+
+  function render(s) {
+    status = s;
+    $('d-sheet').className = 'dot' + (s.sheetReady ? ' ok' : '');
+    $('d-keys').className = 'dot' + (s.hasKeys ? ' ok' : '');
+    $('d-conn').className = 'dot' + (s.connected ? ' ok' : '');
+    $('d-auto').className = 'dot' + (s.autoSync ? ' ok' : '');
+    $('auto-text').textContent = s.autoSync ? 'Auto-sync on (every ' + s.everyMinutes + ' min)' : 'Auto-sync off';
+    $('b-auto').textContent = s.autoSync ? 'Stop auto-sync' : 'Start auto-sync';
+    $('last').textContent = s.lastSync ? 'Last sync: ' + s.lastSync : 'Not synced yet';
+    const err = $('err'); err.textContent = s.lastError || ''; err.style.display = s.lastError ? 'block' : 'none';
+    if (s.webAppUrl) $('webapp').innerHTML = '<code>' + s.webAppUrl.replace(/[<>&"]/g, '') + '</code>';
+    if (!$('clientId').value) $('clientId').value = s.clientId;
+    if (!$('runame').value) $('runame').value = s.runame;
+    $('env').value = s.env;
+  }
+
+  function refresh() { google.script.run.withSuccessHandler(render).withFailureHandler(fail).getStatus(); }
+
+  function run(fn, okText) {
+    busy(true); show('');
+    google.script.run.withSuccessHandler(r => { busy(false); show(typeof r === 'string' ? r : okText, false); refresh(); })
+      .withFailureHandler(fail)[fn]();
+  }
+  function call(fn, arg, okText) {
+    busy(true); show('');
+    google.script.run.withSuccessHandler(s => { busy(false); show(okText, false); render(s); })
+      .withFailureHandler(fail)[fn](...(arg === undefined ? [] : [arg]));
+  }
+  function saveKeys() {
+    call('saveKeys', { clientId: $('clientId').value, clientSecret: $('clientSecret').value,
+      runame: $('runame').value, env: $('env').value }, 'Keys saved.');
+    $('clientSecret').value = '';
+  }
+  function connect() {
+    busy(true);
+    google.script.run.withSuccessHandler(url => {
+      busy(false); window.open(url, '_blank');
+      show('Finish signing in on eBay, then come back. This panel updates itself.', false);
+      const t = setInterval(() => google.script.run.withSuccessHandler(s => {
+        render(s); if (s.connected) { clearInterval(t); show('eBay connected.', false); }
+      }).getStatus(), 3000);
+      setTimeout(() => clearInterval(t), 300000);
+    }).withFailureHandler(fail).getConnectUrl();
+  }
+  function finish() { call('finishConnect', $('pasted').value, 'eBay connected.'); }
+  function legacy() { call('saveLegacyToken', $('legacy').value, 'Token saved. Now press Test connection.'); }
+  function toggleAuto() {
+    busy(true);
+    google.script.run.withSuccessHandler(s => { busy(false); render(s); })
+      .withFailureHandler(fail)[status.autoSync ? 'disableAutoSync' : 'enableAutoSync']();
+  }
+  function disconnect() {
+    if (confirm('Remove the saved eBay keys and connection, and stop auto-sync?')) call('disconnectEbay', undefined, 'Disconnected.');
+  }
+  refresh();
+</script>
+</body>
+</html>

@@ -5,10 +5,27 @@ const path = require('path');
 const vm = require('vm');
 const assert = require('assert');
 
-const ctx = vm.createContext({ console });
+// Minimal stand-ins for the Apps Script services used by the sign-in callback.
+const store = {}, cacheStore = {}, fetched = [];
+const services = {
+  console,
+  PropertiesService: { getScriptProperties: () => ({
+    getProperty: k => (k in store ? store[k] : null), setProperty: (k, v) => { store[k] = v; },
+    deleteProperty: k => { delete store[k]; } }) },
+  CacheService: { getScriptCache: () => ({
+    get: k => (k in cacheStore ? cacheStore[k] : null), put: (k, v) => { cacheStore[k] = v; },
+    remove: k => { delete cacheStore[k]; } }) },
+  Utilities: { getUuid: () => 'nonce-' + Object.keys(cacheStore).length, base64Encode: s => Buffer.from(s).toString('base64') },
+  UrlFetchApp: { fetch: (url, o) => { fetched.push({ url, o });
+    return { getResponseCode: () => 200, getContentText: () => JSON.stringify({ refresh_token: 'RT-123', access_token: 'AT', expires_in: 7200 }) }; } },
+  HtmlService: { createHtmlOutput: html => ({ html, setTitle() { return this; } }) },
+  SpreadsheetApp: { getActive: () => ({ getSheetByName: () => null }) },
+  ScriptApp: { getProjectTriggers: () => [], getService: () => ({ getUrl: () => '' }) },
+};
+const ctx = vm.createContext(services);
 vm.runInContext(fs.readFileSync(path.join(__dirname, '../apps-script/Code.gs'), 'utf8') +
-  '\nthis.api={parseListings_,parseErrors_,planSync_,extractCode_,STATUS};', ctx);
-const { parseListings_, parseErrors_, planSync_, extractCode_, STATUS } = ctx.api;
+  '\nthis.api={parseListings_,parseErrors_,planSync_,extractCode_,STATUS,doGet,getConnectUrl,saveKeys,getStatus};', ctx);
+const { parseListings_, parseErrors_, planSync_, extractCode_, STATUS, doGet, getConnectUrl, saveKeys, getStatus } = ctx.api;
 
 const activeXml = `<?xml version="1.0"?><GetMyeBaySellingResponse xmlns="urn:ebay:apis:eBLBaseComponents">
 <Ack>Success</Ack><ActiveList><ItemArray>
@@ -83,5 +100,33 @@ assert.strictEqual(J(again.rows[2])[8], 'T2');
 
 // Low-stock threshold
 assert.strictEqual(J(planSync_([['555555555555', 'x']], active, lookup, opts).rows[0])[7], STATUS.LOW);
+
+// ---- sign-in callback (doGet) ----
+assert.throws(() => getConnectUrl(), /Save your eBay app keys/);
+assert.throws(() => saveKeys({ clientId: 'a', runame: 'b' }), /required/);
+saveKeys({ clientId: 'APP', clientSecret: 'SECRET', runame: 'My-RuName', env: 'PRODUCTION' });
+const st = JSON.stringify(getStatus());
+assert.ok(!st.includes('SECRET'));                                              // secrets never go to the panel
+assert.strictEqual(getStatus().connected, false);
+
+// a callback with an unknown state must NOT reach eBay or store anything
+let page = doGet({ parameter: { code: 'evil', state: 'guessed' } });
+assert.match(page.html, /not started from your sheet/);
+assert.strictEqual(fetched.length, 0);
+assert.strictEqual(store.EBAY_REFRESH_TOKEN, undefined);
+
+// the real flow: state from getConnectUrl() is accepted once
+const url = getConnectUrl();
+assert.match(url, /client_id=APP&response_type=code&redirect_uri=My-RuName/);
+const state = /state=([^&]+)/.exec(url)[1];
+page = doGet({ parameter: { code: 'good-code', state } });
+assert.match(page.html, /eBay is connected/);
+assert.strictEqual(store.EBAY_REFRESH_TOKEN, 'RT-123');
+assert.strictEqual(fetched.length, 1);
+assert.match(fetched[0].o.payload.code, /good-code/);
+assert.strictEqual(getStatus().connected, true);
+page = doGet({ parameter: { code: 'good-code', state } });                      // replay is rejected
+assert.match(page.html, /not started from your sheet/);
+assert.strictEqual(fetched.length, 1);
 
 console.log('all tests passed');
